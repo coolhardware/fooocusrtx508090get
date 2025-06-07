@@ -4,9 +4,11 @@ import time
 import random
 import os
 import sys
+import asyncio
+from datetime import datetime
 from urllib.parse import parse_qs
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import threading
@@ -85,6 +87,7 @@ async def root():
             "generate": "/generate",
             "status": "/status/{job_id}",
             "result": "/result/{job_id}",
+            "batch": "/batch/{batch_id}",
             "models": "/models",
             "version": "/version"
         }
@@ -120,6 +123,331 @@ async def version_info():
         }
     })
 
+async def generate_with_all_models(**kwargs):
+    """Generate images with all available models"""
+    from PIL import Image, ImageDraw, ImageFont
+    import zipfile
+    import io
+    import math
+    
+    # Extract parameters
+    base_model = kwargs.get('base_model', 'ALL')
+    comparison_mode = kwargs.get('comparison_mode', 'grid')
+    max_parallel = kwargs.get('max_parallel', 1)
+    models_limit = kwargs.get('models_limit', 0)
+    debug = kwargs.get('debug', False)
+    
+    # Get list of models to use
+    all_models = modules.config.model_filenames
+    
+    # Filter models if pattern provided (e.g., "ALL:pony" for all pony models)
+    if ':' in base_model:
+        pattern = base_model.split(':', 1)[1].lower()
+        all_models = [m for m in all_models if pattern in m.lower()]
+    
+    # Apply limit if specified
+    if models_limit > 0:
+        all_models = all_models[:models_limit]
+    
+    if len(all_models) == 0:
+        raise HTTPException(status_code=400, detail="No models found matching criteria")
+    
+    print(f"[API] Generating with {len(all_models)} models")
+    
+    # Generate unique batch ID
+    batch_id = str(uuid.uuid4())
+    batch_start_time = datetime.now()
+    
+    # Create results storage
+    batch_results = {
+        'batch_id': batch_id,
+        'status': 'processing',
+        'total_models': len(all_models),
+        'completed': 0,
+        'failed': 0,
+        'results': {},
+        'start_time': batch_start_time.isoformat(),
+        'parameters': kwargs
+    }
+    
+    # Store in results queue
+    results_queue[f"batch_{batch_id}"] = batch_results
+    
+    # Function to generate with a single model
+    async def generate_single_model(model_name):
+        try:
+            print(f"[API] Generating with model: {model_name}")
+            
+            # Create a copy of kwargs and update model
+            single_kwargs = kwargs.copy()
+            single_kwargs['base_model'] = model_name
+            single_kwargs['async_mode'] = False  # We handle async here
+            
+            # Use the original generation logic
+            result = await generate_image(**single_kwargs)
+            
+            # If successful, result is a FileResponse
+            if isinstance(result, FileResponse):
+                batch_results['results'][model_name] = {
+                    'status': 'completed',
+                    'image_path': result.path,
+                    'model': model_name,
+                    'time': datetime.now().isoformat()
+                }
+                batch_results['completed'] += 1
+            
+        except Exception as e:
+            print(f"[API] Failed to generate with {model_name}: {str(e)}")
+            batch_results['results'][model_name] = {
+                'status': 'failed',
+                'error': str(e),
+                'model': model_name,
+                'time': datetime.now().isoformat()
+            }
+            batch_results['failed'] += 1
+    
+    # Generate with all models
+    if max_parallel > 1:
+        # Parallel generation
+        for i in range(0, len(all_models), max_parallel):
+            batch = all_models[i:i + max_parallel]
+            batch_tasks = [generate_single_model(model) for model in batch]
+            await asyncio.gather(*batch_tasks)
+    else:
+        # Sequential generation
+        for model in all_models:
+            await generate_single_model(model)
+    
+    # Mark as completed
+    batch_results['status'] = 'completed'
+    batch_results['end_time'] = datetime.now().isoformat()
+    
+    # Handle different comparison modes
+    if comparison_mode == 'json':
+        # Return JSON summary
+        return JSONResponse({
+            'batch_id': batch_id,
+            'summary': {
+                'total': batch_results['total_models'],
+                'completed': batch_results['completed'],
+                'failed': batch_results['failed'],
+                'duration': str(datetime.now() - batch_start_time)
+            },
+            'results': batch_results['results'],
+            'view_url': f"/batch/{batch_id}"
+        })
+    
+    elif comparison_mode == 'grid':
+        # Create a grid image with all results
+        completed_results = [r for r in batch_results['results'].values() if r['status'] == 'completed']
+        
+        if len(completed_results) == 0:
+            raise HTTPException(status_code=500, detail="No images were successfully generated")
+        
+        # Create grid
+        grid_path = create_comparison_grid(completed_results, batch_id, kwargs)
+        
+        return FileResponse(
+            grid_path,
+            media_type='image/png',
+            headers={
+                "Content-Disposition": f"inline; filename=comparison_{batch_id}.png"
+            }
+        )
+    
+    elif comparison_mode == 'zip':
+        # Create a zip file with all images
+        zip_path = create_comparison_zip(batch_results['results'], batch_id, kwargs)
+        
+        return FileResponse(
+            zip_path,
+            media_type='application/zip',
+            headers={
+                "Content-Disposition": f"attachment; filename=comparison_{batch_id}.zip"
+            }
+        )
+    
+    else:  # history mode
+        # Return HTML with links to history
+        html_content = create_comparison_html(batch_results, batch_id)
+        
+        return HTMLResponse(content=html_content)
+
+def create_comparison_grid(results, batch_id, params):
+    """Create a grid image comparing all model outputs"""
+    from PIL import Image, ImageDraw, ImageFont
+    import math
+    
+    images = []
+    labels = []
+    
+    # Load all images
+    for result in results:
+        if 'image_path' in result and os.path.exists(result['image_path']):
+            img = Image.open(result['image_path'])
+            images.append(img)
+            labels.append(os.path.basename(result['model']).replace('.safetensors', ''))
+    
+    if not images:
+        raise ValueError("No images to create grid")
+    
+    # Calculate grid dimensions
+    cols = math.ceil(math.sqrt(len(images)))
+    rows = math.ceil(len(images) / cols)
+    
+    # Get dimensions of first image
+    img_width, img_height = images[0].size
+    label_height = 30
+    
+    # Create grid image
+    grid_width = cols * img_width
+    grid_height = rows * (img_height + label_height)
+    grid = Image.new('RGB', (grid_width, grid_height), 'white')
+    draw = ImageDraw.Draw(grid)
+    
+    # Try to load a font, fall back to default if not available
+    try:
+        font = ImageFont.truetype("arial.ttf", 20)
+    except:
+        font = ImageFont.load_default()
+    
+    # Place images in grid
+    for idx, (img, label) in enumerate(zip(images, labels)):
+        row = idx // cols
+        col = idx % cols
+        x = col * img_width
+        y = row * (img_height + label_height)
+        
+        # Paste image
+        grid.paste(img, (x, y))
+        
+        # Draw label
+        text_bbox = draw.textbbox((0, 0), label, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_x = x + (img_width - text_width) // 2
+        text_y = y + img_height + 5
+        draw.text((text_x, text_y), label, fill='black', font=font)
+    
+    # Add title
+    title = f"Model Comparison: {params.get('prompt', '')[:50]}..."
+    title_bbox = draw.textbbox((0, 0), title, font=font)
+    title_width = title_bbox[2] - title_bbox[0]
+    draw.text(((grid_width - title_width) // 2, 5), title, fill='black', font=font)
+    
+    # Save grid
+    grid_path = os.path.join(modules.config.path_outputs, f"comparison_grid_{batch_id}.png")
+    grid.save(grid_path)
+    
+    return grid_path
+
+def create_comparison_zip(results, batch_id, params):
+    """Create a zip file with all generated images"""
+    import zipfile
+    import json
+    
+    zip_path = os.path.join(modules.config.path_outputs, f"comparison_{batch_id}.zip")
+    
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        # Add metadata
+        metadata = {
+            'batch_id': batch_id,
+            'parameters': params,
+            'results': {}
+        }
+        
+        # Add images
+        for model_name, result in results.items():
+            if result['status'] == 'completed' and 'image_path' in result:
+                if os.path.exists(result['image_path']):
+                    # Create a nice filename
+                    safe_model_name = os.path.basename(model_name).replace('.safetensors', '')
+                    arc_name = f"{safe_model_name}.{params.get('output_format', 'png')}"
+                    zipf.write(result['image_path'], arc_name)
+                    metadata['results'][model_name] = arc_name
+        
+        # Add metadata file
+        zipf.writestr('metadata.json', json.dumps(metadata, indent=2))
+        
+        # Add comparison info
+        info_txt = f"""Model Comparison Batch
+Batch ID: {batch_id}
+Prompt: {params.get('prompt')}
+Negative: {params.get('negative_prompt')}
+Models: {len(results)}
+Completed: {sum(1 for r in results.values() if r['status'] == 'completed')}
+Failed: {sum(1 for r in results.values() if r['status'] == 'failed')}
+"""
+        zipf.writestr('info.txt', info_txt)
+    
+    return zip_path
+
+def create_comparison_html(batch_results, batch_id):
+    """Create HTML page showing comparison results"""
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Model Comparison - {batch_id}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            .header {{ background: #f0f0f0; padding: 20px; border-radius: 5px; }}
+            .results {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; margin-top: 20px; }}
+            .result {{ border: 1px solid #ddd; padding: 10px; border-radius: 5px; }}
+            .success {{ background: #f0fff0; }}
+            .failed {{ background: #fff0f0; }}
+            .model-name {{ font-weight: bold; margin-bottom: 10px; }}
+            .view-link {{ display: block; margin-top: 10px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Model Comparison Results</h1>
+            <p><strong>Batch ID:</strong> {batch_id}</p>
+            <p><strong>Prompt:</strong> {batch_results['parameters'].get('prompt')}</p>
+            <p><strong>Total Models:</strong> {batch_results['total_models']}</p>
+            <p><strong>Completed:</strong> {batch_results['completed']}</p>
+            <p><strong>Failed:</strong> {batch_results['failed']}</p>
+            <p><a href="/batch/{batch_id}/download">Download All as ZIP</a></p>
+        </div>
+        
+        <div class="results">
+    """
+    
+    for model_name, result in batch_results['results'].items():
+        status_class = 'success' if result['status'] == 'completed' else 'failed'
+        html += f"""
+            <div class="result {status_class}">
+                <div class="model-name">{os.path.basename(model_name).replace('.safetensors', '')}</div>
+                <div>Status: {result['status']}</div>
+        """
+        
+        if result['status'] == 'completed':
+            html += f"""
+                <a class="view-link" href="file://{result['image_path']}" target="_blank">View Image</a>
+            """
+        else:
+            html += f"""
+                <div style="color: red;">Error: {result.get('error', 'Unknown error')}</div>
+            """
+        
+        html += """
+            </div>
+        """
+    
+    html += """
+        </div>
+        <script>
+            // Auto-refresh while processing
+            if (document.querySelector('.header').textContent.includes('processing')) {
+                setTimeout(() => location.reload(), 5000);
+            }
+        </script>
+    </body>
+    </html>
+    """
+    
+    return html
+
 @app.get("/generate")
 async def generate_image(
     prompt: str = Query(..., description="Positive prompt for image generation"),
@@ -131,7 +459,7 @@ async def generate_image(
     seed: int = Query(-1, description="Seed for generation, -1 for random"),
     sharpness: float = Query(2.0, description="Image sharpness"),
     guidance_scale: float = Query(4.0, description="Guidance scale"),
-    base_model: str = Query("", description="Base model name (empty for default)"),
+    base_model: str = Query("", description="Base model name (empty for default, 'ALL' for all models, 'ALL:pattern' for pattern matching)"),
     refiner_model: str = Query("", description="Refiner model name (empty for default)"),
     refiner_switch: float = Query(0.5, description="Refiner switch point"),
     loras: str = Query("", description="LoRA settings as name:weight,name:weight"),
@@ -140,11 +468,40 @@ async def generate_image(
     output_format: str = Query('png', description="Output format (png, jpg, webp)"),
     save_metadata: bool = Query(True, description="Save metadata to images"),
     async_mode: bool = Query(False, description="Return immediately with job ID"),
-    debug: bool = Query(False, description="Enable debug output")
+    debug: bool = Query(False, description="Enable debug output"),
+    comparison_mode: str = Query('grid', description="For ALL models: 'grid', 'history', 'json', or 'zip'"),
+    max_parallel: int = Query(1, description="Maximum parallel generations for ALL mode"),
+    models_limit: int = Query(0, description="Limit number of models when using ALL (0 = no limit)")
 ):
     """Generate images based on provided parameters"""
     
     try:
+        # Check if using ALL models
+        if base_model.upper().startswith('ALL'):
+            return await generate_with_all_models(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                style=style,
+                performance=performance,
+                aspect_ratio=aspect_ratio,
+                image_number=image_number,
+                seed=seed,
+                sharpness=sharpness,
+                guidance_scale=guidance_scale,
+                base_model=base_model,
+                refiner_model=refiner_model,
+                refiner_switch=refiner_switch,
+                loras=loras,
+                sampler=sampler,
+                scheduler=scheduler,
+                output_format=output_format,
+                save_metadata=save_metadata,
+                comparison_mode=comparison_mode,
+                max_parallel=max_parallel,
+                models_limit=models_limit,
+                debug=debug
+            )
+        
         # Generate unique job ID
         job_id = str(uuid.uuid4())
         
@@ -509,6 +866,33 @@ async def get_result(job_id: str, index: int = Query(0, description="Image index
         media_type=mime_type,
         headers={
             "Content-Disposition": f"inline; filename=result_{job_id}_{index}{ext}"
+        }
+    )
+
+@app.get("/batch/{batch_id}")
+async def get_batch_status(batch_id: str):
+    """Get status of a batch generation"""
+    key = f"batch_{batch_id}"
+    if key not in results_queue:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    return JSONResponse(results_queue[key])
+
+@app.get("/batch/{batch_id}/download")
+async def download_batch(batch_id: str):
+    """Download all images from a batch as ZIP"""
+    key = f"batch_{batch_id}"
+    if key not in results_queue:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    batch_results = results_queue[key]
+    zip_path = create_comparison_zip(batch_results['results'], batch_id, batch_results['parameters'])
+    
+    return FileResponse(
+        zip_path,
+        media_type='application/zip',
+        headers={
+            "Content-Disposition": f"attachment; filename=comparison_{batch_id}.zip"
         }
     )
 
