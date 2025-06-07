@@ -40,6 +40,13 @@ args_parser.parser.add_argument("--always-download-new-model", action='store_tru
 args_parser.parser.add_argument("--rebuild-hash-cache", help="Generates missing model and LoRA hashes.",
                                 type=int, nargs="?", metavar="CPU_NUM_THREADS", const=-1)
 
+args_parser.parser.add_argument("--api", action='store_true', 
+                                help="Enable GET API for image generation")
+args_parser.parser.add_argument("--api-host", type=str, default='127.0.0.1',
+                                help="API server host")
+args_parser.parser.add_argument("--api-port", type=int, default=8888,
+                                help="API server port")
+
 args_parser.parser.set_defaults(
     disable_cuda_malloc=True,
     in_browser=True,

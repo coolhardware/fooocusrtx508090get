@@ -1119,6 +1119,20 @@ def dump_default_english_config():
 
 # dump_default_english_config()
 
+# Add at the top with other imports
+import threading
+
+# Add before gradio launch
+if hasattr(args_manager.args, 'api') and args_manager.args.api:
+    import api_server
+    api_thread = threading.Thread(
+        target=api_server.run_api_server, 
+        kwargs={'host': args_manager.args.api_host, 'port': args_manager.args.api_port},
+        daemon=True
+    )
+    api_thread.start()
+    print(f"API server started at http://{args_manager.args.api_host}:{args_manager.args.api_port}")
+
 shared.gradio_root.launch(
     inbrowser=args_manager.args.in_browser,
     server_name=args_manager.args.listen,
