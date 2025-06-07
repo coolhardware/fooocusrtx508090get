@@ -106,7 +106,7 @@ You are responsible for following licensing and usage rules when distributing or
 After launching Fooocus, you can request image generation via HTTP:
 
 ```
-http://localhost:7860/generate?prompt=A+cat&steps=20
+http://localhost:7865/generate?prompt=A+cat&steps=20
 ```
 
 Include Basic Authentication credentials if they are configured in `auth.json`. The endpoint returns the generated image file on success or a JSON error message otherwise.
