@@ -168,7 +168,6 @@ def _api_auth(credentials: HTTPBasicCredentials = Depends(security)):
             )
 
 
-@shared.gradio_root.app.get("/generate")
 async def api_generate(
     prompt: str,
     negative_prompt: str = "",
@@ -1155,12 +1154,15 @@ def dump_default_english_config():
 
 # dump_default_english_config()
 
-shared.gradio_root.launch(
+app, local_url, share_url = shared.gradio_root.launch(
     inbrowser=args_manager.args.in_browser,
     server_name=args_manager.args.listen,
     server_port=args_manager.args.port,
     share=args_manager.args.share,
     auth=check_auth if (args_manager.args.share or args_manager.args.listen) and auth_enabled else None,
     allowed_paths=[modules.config.path_outputs],
-    blocked_paths=[constants.AUTH_FILENAME]
+    blocked_paths=[constants.AUTH_FILENAME],
+    prevent_thread_lock=True
 )
+shared.gradio_root.app.add_api_route("/generate", api_generate, methods=["GET"])
+shared.gradio_root.block_thread()
