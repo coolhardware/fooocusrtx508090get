@@ -23,9 +23,6 @@ from modules.private_logger import get_current_html_path
 from modules.ui_gradio_extensions import reload_javascript
 from modules.auth import auth_enabled, check_auth
 from modules.util import is_json
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import FileResponse, JSONResponse
 
 def get_task(*args):
     args = list(args)
@@ -154,39 +151,6 @@ if isinstance(args_manager.args.preset, str):
     title += ' ' + args_manager.args.preset
 
 shared.gradio_root = gr.Blocks(title=title).queue()
-
-# expose a simple API endpoint for programmatic generation
-security = HTTPBasic()
-
-def _api_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    if (args_manager.args.share or args_manager.args.listen) and auth_enabled:
-        if not check_auth(credentials.username, credentials.password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials",
-                headers={"WWW-Authenticate": "Basic"},
-            )
-
-
-@shared.gradio_root.app.get("/generate")
-async def api_generate(
-    prompt: str,
-    negative_prompt: str = "",
-    steps: int | None = None,
-    credentials: HTTPBasicCredentials = Depends(_api_auth),
-):
-    params = {"prompt": prompt, "negative_prompt": negative_prompt}
-    if steps is not None:
-        params["steps"] = steps
-    parsed = modules.meta_parser.load_parameter_button_click(
-        params, False, modules.flags.inpaint_option_default
-    )
-    task = get_task(*parsed)
-    for _ in generate_clicked(task):
-        pass
-    if task.results:
-        return FileResponse(task.results[0])
-    return JSONResponse({"error": "generation failed"})
 
 with shared.gradio_root:
     currentTask = gr.State(worker.AsyncTask(args=[]))
